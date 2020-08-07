@@ -1,0 +1,13 @@
+#!/bin/sh /etc/rc.common
+# /etc/init.d/mycpe
+START=95
+PID=/tmp/mycpe.pid
+start(){
+	/etc/init.d/mycpe enable
+	/usr/sbin/mycpe >/dev/null 2>&1 &
+}
+
+stop(){
+	kill -9 `cat $PID`
+}
+

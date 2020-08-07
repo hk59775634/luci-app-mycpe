@@ -1,0 +1,218 @@
+#!/bin/sh
+. /lib/functions/network.sh
+_checkpid(){
+	pid=`echo $$`
+	pname=`echo $0`
+	mypidfile=/tmp/mycpe.pid
+	if test -f "$mypidfile";then
+		expid=`cat $mypidfile`
+		if grep $pname /proc/`cat $mypidfile`/cmdline > /dev/null 2>&1 ;then
+			echo "The process $pname is already exists ! pid:$expid."
+			exit 0
+		fi		
+	fi
+	echo $pid > $mypidfile
+}
+
+_getinfo(){
+	touch /etc/config/mycpe
+	uci get  mycpe.@mycpe[0] > /dev/null 
+	if [ "$?" != "0" ];then
+		 uci add mycpe mycpe
+		 uci add_list mycpe.@mycpe[0].subnets="192.168.0.0/16"
+		 uci add_list mycpe.@mycpe[0].subnets="100.64.0.0/12"
+		 uci add_list mycpe.@mycpe[0].subnets="172.16.0.0/10"
+		 uci add_list mycpe.@mycpe[0].subnets="10.0.0.0/8"
+		 uci commit mycpe
+	fi
+	echo "" > /etc/dnsmasq.conf
+	/etc/init.d/dnsmasq restart
+	network_find_wan NET_IF
+	network_get_ipaddr NET_IP "${NET_IF}"
+	#echo wan ip is $NET_IP
+	network_get_dnsserver NET_DNS "${NET_IF}"
+	#echo wan dns is ${NET_DNS%% *}
+	network_get_gateway NET_GATEWAY "${NET_IF}"
+	#echo wan gateway ip is $NET_GATEWAY
+	if opkg list-installed|grep quagga > /dev/null 2>&1;then
+		quagga=1
+	else
+		quagga=0
+	fi
+	if dnsmasq --help|grep chnroute > /dev/null 2>&1;then
+		dnsmasq=1
+	else
+		dnsmasq=0
+	fi
+}
+
+_checkdnsmasq(){
+	if [ "$dnsmasq" = "1" ];then
+cat>/tmp/dnsmasq.tmp<<EOF
+no-resolv
+all-servers
+server=${NET_DNS%% *},0
+server=1.1.1.1,1
+chnroutes-file=/etc/chnroute
+
+EOF
+		dnsconfmd5=`md5sum /tmp/dnsmasq.tmp|awk '{print $1}'`
+		dnsmasqmd5=`md5sum /etc/dnsmasq.conf|awk '{print $1}'`
+		if [ "$dnsconfmd5" != "$dnsmasqmd5" ];then
+			cp /tmp/dnsmasq.tmp /etc/dnsmasq.conf
+			/etc/init.d/dnsmasq restart
+		fi
+	else
+		dnsconf=`wc -l /etc/dnsmasq.conf|awk '{print $1}'`
+		if [ "$dnsconf" -gt "1" ];then
+			echo "" > /etc/dnsmasq.conf
+			/etc/init.d/dnsmasq restart
+		fi
+	fi
+	
+}
+
+_checkroute(){
+	if [ "$quagga" = "1" ];then
+		if [ "$vpnside" = "2" ];then
+			routenum=`ip route|grep vpn-tochina|wc -l`
+			if [ "$routenum" -lt "5000" ];then
+				sed 's/^/ip route &/g' /etc/chnroute > /etc/quagga/zebra.conf
+				sed -i 's/$/& vpn-tochina/g' /etc/quagga/zebra.conf
+				/etc/init.d/quagga restart
+				/etc/init.d/dnsmasq restart
+			fi
+		else
+			routenum=`ip route|grep $NET_GATEWAY|wc -l`
+			if [ "$routenum" -lt "5000" ];then
+				sed 's/^/ip route &/g' /etc/chnroute > /etc/quagga/zebra.conf
+				sed -i "s/$/& $NET_GATEWAY/g" /etc/quagga/zebra.conf
+				echo ip route 0.0.0.0/1 vpn-toglobal >> /etc/quagga/zebra.conf
+				echo ip route 128.0.0.0/1 vpn-toglobal >> /etc/quagga/zebra.conf
+				/etc/init.d/quagga restart
+				/etc/init.d/dnsmasq restart
+			fi
+		fi
+	else
+		if [ "$vpnside" = "2" ];then
+			routenum=`ip route|grep vpn-tochina|wc -l`
+			if [ "$routenum" -lt "5000" ];then
+				for ip in `cat /etc/chnroute`;do
+					ip route add $ip vpn-tochina
+				done
+				/etc/init.d/dnsmasq restart
+			fi
+		else
+			routenum=`ip route|grep $NET_GATEWAY|wc -l`
+			if [ "$routenum" -lt "5000" ];then
+				for ip in `cat /etc/chnroute`;do
+					echo ip route add $ip $NET_GATEWAY
+				done
+				ip route 0.0.0.0/1 vpn-toglobal
+				ip route 128.0.0.0/1 vpn-toglobal
+				/etc/init.d/dnsmasq restart
+			fi
+		fi
+	fi
+	_checkdnsmasq
+}
+
+_connectvpn(){
+	uci set network.$vpname=interface
+	uci set network.$vpname.proto='openconnect'
+	uci set network.$vpname.server=`uci get mycpe.@mycpe[0].server`
+	uci set network.$vpname.username=`uci get mycpe.@mycpe[0].username`
+	uci set network.$vpname.password=`uci get mycpe.@mycpe[0].password`
+	uci set network.$vpname.defaultroute='0'
+	uci set network.$vpname.delegate='0'
+	uci commit network
+	zone=`uci get firewall.@zone[1].network`
+	if uci get firewall.@zone[1].network|grep $vpname >/dev/null 2>&1;then
+		uci commit firewall
+	else
+		uci del firewall.@zone[1].network
+		uci set firewall.@zone[1].network="$zone $vpname"
+		uci commit firewall
+	fi
+	/etc/init.d/firewall reload
+	ifup $vpname
+}
+
+_checkvpnconnect(){
+	vpnside=`uci get mycpe.@mycpe[0].selectroute`
+	if [ "$vpnside" = "2" ];then
+		vpname=tochina
+		ifdown vpn-toglobal > /dev/null 2>&1
+		uci del network.toglobal > /dev/null 2>&1
+		uci commit network > /dev/null 2>&1
+	else
+		vpname=toglobal
+		ifdown vpn-tochina > /dev/null 2>&1
+		uci del network.tochina > /dev/null 2>&1
+		uci commit network > /dev/null 2>&1
+	fi	
+	if ifconfig vpn-$vpname >/dev/null 2>&1;then
+		_checkroute
+	else
+		_connectvpn
+	fi
+}
+
+_checkmycpe(){
+	if uci get mycpe.@mycpe[0].enable >/dev/null 2>&1;then
+		_checkvpnconnect
+	fi
+}
+
+_checkupdate(){
+	onlinemd5=`curl -s -k --connect-timeout 3 https://raw.githubusercontent.com/hk59775634/luci-app-mycpeconfig/master/openwrt/md5|tail -1|awk '{print $1}'`
+	localmd5=`uci get mycpe.@mycpe[0].version`
+	if [ "$onlinemd5" = "$localmd5" ];then
+		return 0
+	else
+		return 1
+	fi
+}
+
+_upgrade(){
+	onlinemd5=`curl -s -k --connect-timeout 3 https://raw.githubusercontent.com/hk59775634/luci-app-mycpeconfig/master/openwrt/md5|tail -1|awk '{print $1}'`
+	onlineipk=`curl -s -k --connect-timeout 3 https://raw.githubusercontent.com/hk59775634/luci-app-mycpeconfig/master/openwrt/md5|tail -1|awk '{print $2}'`
+	curl -s -L -k --connect-timeout 5 https://github.com/hk59775634/luci-app-mycpeconfig/raw/master/openwrt/$onlineipk > /tmp/$onlineipk
+	tmpmd5=`md5sum /tmp/$onlineipk|awk '{print $1}'`
+	if [ "$onlinemd5" = "$tmpmd5" ];then
+		opkg install /tmp/$onlineipk --force-depends
+		if [ "$?" = "0" ];then
+			return 0
+		else
+			return 1
+		fi
+	else
+		return 1
+	fi
+}
+
+_start(){
+	_checkpid
+	_getinfo
+	while true;do
+		_checkmycpe
+	sleep 5
+	done
+}
+
+action=$1
+case "$action" in
+stop) 
+	_stop
+	;;
+checkupdate) 
+	_checkupdate
+	;;
+upgrade) 
+	_upgrade
+	;;
+*)
+    _start
+    ;;
+esac
+
