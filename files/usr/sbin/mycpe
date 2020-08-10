@@ -1,6 +1,7 @@
 #!/bin/sh
 . /lib/functions/network.sh
 _checkpid(){
+	#Check the PID and prohibit repeated operation.
 	pid=`echo $$`
 	pname=`echo $0`
 	mypidfile=/tmp/mycpe.pid
@@ -14,40 +15,65 @@ _checkpid(){
 	echo $pid > $mypidfile
 }
 
+_get_uuid(){
+	#Get the unique UUID code of the device.
+	uci get mycpe.@mycpe[0].uuid > /dev/null 2>&1
+	if [ "$?" != "0" ];then
+		dmidecode > /dev/null 2>&1
+		if [ "$?" = "0" ];then
+			md5=`dmidecode | md5sum | awk '{print $1}'`
+			uuid=`echo ${md5:0:8}-${md5:8:4}-${md5:12:4}-${md5:16:4}-${md5:0-12}`
+        else
+			uuid=`cat /proc/sys/kernel/random/uuid`  
+        fi
+		uci set mycpe.@mycpe[0].uuid=$uuid
+		uci commit mycpe       
+	else
+		uuid=`uci get mycpe.@mycpe[0].uuid`
+	fi
+	echo uuid is $uuid
+}
+
 _getinfo(){
+	#check mycpe uci config
 	touch /etc/config/mycpe
-	uci get  mycpe.@mycpe[0] > /dev/null 
+	uci get  mycpe.@mycpe[0] > /dev/null 2>&1
 	if [ "$?" != "0" ];then
 		 uci add mycpe mycpe
-		 uci add_list mycpe.@mycpe[0].subnets="192.168.0.0/16"
-		 uci add_list mycpe.@mycpe[0].subnets="100.64.0.0/12"
-		 uci add_list mycpe.@mycpe[0].subnets="172.16.0.0/10"
-		 uci add_list mycpe.@mycpe[0].subnets="10.0.0.0/8"
+		 #uci add_list mycpe.@mycpe[0].subnets="192.168.0.0/16"
+		 #uci add_list mycpe.@mycpe[0].subnets="100.64.0.0/12"
+		 #uci add_list mycpe.@mycpe[0].subnets="172.16.0.0/10"
+		 #uci add_list mycpe.@mycpe[0].subnets="10.0.0.0/8"
 		 uci commit mycpe
 	fi
-	echo "" > /etc/dnsmasq.conf
-	/etc/init.d/dnsmasq restart
-	network_find_wan NET_IF
-	network_get_ipaddr NET_IP "${NET_IF}"
-	#echo wan ip is $NET_IP
-	network_get_dnsserver NET_DNS "${NET_IF}"
-	#echo wan dns is ${NET_DNS%% *}
-	network_get_gateway NET_GATEWAY "${NET_IF}"
-	#echo wan gateway ip is $NET_GATEWAY
+	#check quagga install
 	if opkg list-installed|grep quagga > /dev/null 2>&1;then
 		quagga=1
 	else
 		quagga=0
 	fi
+	#check dnsmasq with chnroute patch
 	if dnsmasq --help|grep chnroute > /dev/null 2>&1;then
 		dnsmasq=1
 	else
 		dnsmasq=0
 	fi
+	#Initialize running dnsmasq
+	grep -r "chnroutes-file" /etc/dnsmasq.conf > /dev/null 2>&1
+	if [ "$?" = "0" ];then
+		echo "" > /etc/dnsmasq.conf
+		/etc/init.d/dnsmasq restart> /dev/null 2>&1
+	else
+		ps|grep `cat /var/run/dnsmasq/*.pid`|grep -v grep > /dev/null 2>&1
+		if [ "$?" != "0" ];then
+			/etc/init.d/dnsmasq restart> /dev/null 2>&1
+		fi
+	fi
 }
 
 _checkdnsmasq(){
 	if [ "$dnsmasq" = "1" ];then
+	_pre_init
 cat>/tmp/dnsmasq.tmp<<EOF
 no-resolv
 all-servers
@@ -60,25 +86,29 @@ EOF
 		dnsmasqmd5=`md5sum /etc/dnsmasq.conf|awk '{print $1}'`
 		if [ "$dnsconfmd5" != "$dnsmasqmd5" ];then
 			cp /tmp/dnsmasq.tmp /etc/dnsmasq.conf
-			/etc/init.d/dnsmasq restart
+			/etc/init.d/dnsmasq restart> /dev/null 2>&1
 		fi
 	else
-		dnsconf=`wc -l /etc/dnsmasq.conf|awk '{print $1}'`
-		if [ "$dnsconf" -gt "1" ];then
+		grep -r "chnroutes-file" /etc/dnsmasq.conf > /dev/null 2>&1
+		if [ "$?" = "0" ];then
 			echo "" > /etc/dnsmasq.conf
-			/etc/init.d/dnsmasq restart
+			/etc/init.d/dnsmasq restart> /dev/null 2>&1
 		fi
 	fi
 	
 }
 
 _checkroute(){
+	uci get mycpe.@mycpe[0].selectroute > /dev/null 2>&1
+	if [ "$?" = "0" ];then
+		vpnside=`uci get mycpe.@mycpe[0].selectroute`
+	fi
 	if [ "$quagga" = "1" ];then
 		if [ "$vpnside" = "2" ];then
-			routenum=`ip route|grep vpn-tochina|wc -l`
+			routenum=`ip route|grep CPE|wc -l`
 			if [ "$routenum" -lt "5000" ];then
 				sed 's/^/ip route &/g' /etc/chnroute > /etc/quagga/zebra.conf
-				sed -i 's/$/& vpn-tochina/g' /etc/quagga/zebra.conf
+				sed -i 's/$/& CPE/g' /etc/quagga/zebra.conf
 				/etc/init.d/quagga restart
 				/etc/init.d/dnsmasq restart
 			fi
@@ -87,71 +117,100 @@ _checkroute(){
 			if [ "$routenum" -lt "5000" ];then
 				sed 's/^/ip route &/g' /etc/chnroute > /etc/quagga/zebra.conf
 				sed -i "s/$/& $NET_GATEWAY/g" /etc/quagga/zebra.conf
-				echo ip route 0.0.0.0/1 vpn-toglobal >> /etc/quagga/zebra.conf
-				echo ip route 128.0.0.0/1 vpn-toglobal >> /etc/quagga/zebra.conf
-				/etc/init.d/quagga restart
-				/etc/init.d/dnsmasq restart
+				echo ip route 0.0.0.0/1 CPE >> /etc/quagga/zebra.conf
+				echo ip route 128.0.0.0/1 CPE >> /etc/quagga/zebra.conf
+				/etc/init.d/quagga restart> /dev/null 2>&1
+				/etc/init.d/dnsmasq restart> /dev/null 2>&1
 			fi
 		fi
 	else
 		if [ "$vpnside" = "2" ];then
-			routenum=`ip route|grep vpn-tochina|wc -l`
+			routenum=`ip route|grep CPE|wc -l`
 			if [ "$routenum" -lt "5000" ];then
 				for ip in `cat /etc/chnroute`;do
-					ip route add $ip vpn-tochina
+					ip route add $ip dev CPE
 				done
-				/etc/init.d/dnsmasq restart
+				/etc/init.d/dnsmasq restart> /dev/null 2>&1
 			fi
 		else
 			routenum=`ip route|grep $NET_GATEWAY|wc -l`
 			if [ "$routenum" -lt "5000" ];then
 				for ip in `cat /etc/chnroute`;do
-					echo ip route add $ip $NET_GATEWAY
+					echo ip route add $ip via $NET_GATEWAY
 				done
-				ip route 0.0.0.0/1 vpn-toglobal
-				ip route 128.0.0.0/1 vpn-toglobal
-				/etc/init.d/dnsmasq restart
+				ip route 0.0.0.0/1 dev CPE
+				ip route 128.0.0.0/1 dev CPE
+				/etc/init.d/dnsmasq restart> /dev/null 2>&1
 			fi
 		fi
 	fi
 	_checkdnsmasq
 }
 
-_connectvpn(){
-	uci set network.$vpname=interface
-	uci set network.$vpname.proto='openconnect'
-	uci set network.$vpname.server=`uci get mycpe.@mycpe[0].server`
-	uci set network.$vpname.username=`uci get mycpe.@mycpe[0].username`
-	uci set network.$vpname.password=`uci get mycpe.@mycpe[0].password`
-	uci set network.$vpname.defaultroute='0'
-	uci set network.$vpname.delegate='0'
-	uci commit network
-	zone=`uci get firewall.@zone[1].network`
-	if uci get firewall.@zone[1].network|grep $vpname >/dev/null 2>&1;then
-		uci commit firewall
-	else
-		uci del firewall.@zone[1].network
-		uci set firewall.@zone[1].network="$zone $vpname"
-		uci commit firewall
+_do_connect() {
+	network_find_wan NET_IF
+	network_get_gateway NET_GATEWAY "${NET_IF}"
+	if [ -n "$VPNGATEWAY" ]; then
+		ip route add $VPNGATEWAY via $NET_GATEWAY
 	fi
-	/etc/init.d/firewall reload
-	ifup $vpname
+	if [ -n "$TUNDEV" ]; then
+		ifconfig $TUNDEV up
+	fi
+	if [ -n "$INTERNAL_IP4_ADDRESS" ]; then
+		ip addr add dev $TUNDEV $INTERNAL_IP4_ADDRESS/$INTERNAL_IP4_NETMASKLEN
+	fi
+	if [ -n "$INTERNAL_IP4_MTU" ]; then
+		ifconfig $TUNDEV mtu $INTERNAL_IP4_MTU
+	fi
+	iptables --list|grep "fw $TUNDEV for CPE" >/dev/null 2>&1
+	if [ "$?" != "0" ];then
+		iptables -I FORWARD -o $TUNDEV -j ACCEPT -m comment --comment "fw $TUNDEV for CPE"
+	fi
+	iptables -t nat --list|grep "fw $TUNDEV for CPE" >/dev/null 2>&1
+	if [ "$?" != "0" ];then
+		iptables -t nat -A POSTROUTING -o $TUNDEV -j MASQUERADE -m comment --comment "fw $TUNDEV for CPE"
+	fi
+}
+
+_do_disconnect() {
+	network_find_wan NET_IF
+	network_get_gateway NET_GATEWAY "${NET_IF}"
+	if [ -n "$TUNDEV" ]; then
+		ip link del $TUNDEV
+	fi
+	if [ -n "$VPNGATEWAY" ]; then
+		ip route del $VPNGATEWAY via $NET_GATEWAY
+	fi
+	iptables --list|grep "fw $TUNDEV for CPE" >/dev/null 2>&1
+	if [ "$?" = "0" ];then
+		iptables -D FORWARD -o $TUNDEV -j ACCEPT -m comment --comment "fw $TUNDEV for CPE"
+	fi
+	iptables -t nat --list|grep "fw $TUNDEV for CPE" >/dev/null 2>&1
+	if [ "$?" = "0" ];then
+		iptables -t nat -D POSTROUTING -o $TUNDEV -j MASQUERADE -m comment --comment "fw $TUNDEV for CPE"
+	fi
+}
+
+_reconnect() {
+	do_disconnect
+	do_connect
+}
+
+_pre_init() {
+	network_find_wan NET_IF
+	network_get_ipaddr NET_IP "${NET_IF}"
+	network_get_dnsserver NET_DNS "${NET_IF}"
+	network_get_gateway NET_GATEWAY "${NET_IF}"
+}
+
+
+_connectvpn(){
+	filepath=$(cd "$(dirname "$0")"; pwd)
+	echo `uci get mycpe.@mycpe[0].password`|openconnect --interface=CPE -b `uci get mycpe.@mycpe[0].server` --user=`uci get mycpe.@mycpe[0].username` -s $0
 }
 
 _checkvpnconnect(){
-	vpnside=`uci get mycpe.@mycpe[0].selectroute`
-	if [ "$vpnside" = "2" ];then
-		vpname=tochina
-		ifdown vpn-toglobal > /dev/null 2>&1
-		uci del network.toglobal > /dev/null 2>&1
-		uci commit network > /dev/null 2>&1
-	else
-		vpname=toglobal
-		ifdown vpn-tochina > /dev/null 2>&1
-		uci del network.tochina > /dev/null 2>&1
-		uci commit network > /dev/null 2>&1
-	fi	
-	if ifconfig vpn-$vpname >/dev/null 2>&1;then
+	if ifconfig CPE >/dev/null 2>&1;then
 		_checkroute
 	else
 		_connectvpn
@@ -159,29 +218,39 @@ _checkvpnconnect(){
 }
 
 _checkmycpe(){
+	_pre_init
+	uci set mycpe.@mycpe[0].net_if=${NET_IF}
+	uci set mycpe.@mycpe[0].net_ip=${NET_IP}
+	uci set mycpe.@mycpe[0].net_dns=${NET_DNS%%}
+	uci set mycpe.@mycpe[0].net_gateway=${NET_GATEWAY}
+	uci commit mycpe
 	if uci get mycpe.@mycpe[0].enable >/dev/null 2>&1;then
 		_checkvpnconnect
 	fi
 }
 
 _checkupdate(){
-	onlinemd5=`curl -s -k --connect-timeout 3 https://raw.githubusercontent.com/hk59775634/luci-app-mycpeconfig/master/openwrt/md5|tail -1|awk '{print $1}'`
+	onlinemd5=`curl -s -k -L --connect-timeout 3 https://github.com/hk59775634/luci-app-mycpe/raw/master/openwrt/md5|tail -1|awk '{print $1}'`
 	localmd5=`uci get mycpe.@mycpe[0].version`
 	if [ "$onlinemd5" = "$localmd5" ];then
 		return 0
 	else
+		uci set mycpe.@mycpe[0].update=$onlinemd5
+		uci commit mycpe
 		return 1
 	fi
 }
 
 _upgrade(){
-	onlinemd5=`curl -s -k --connect-timeout 3 https://raw.githubusercontent.com/hk59775634/luci-app-mycpeconfig/master/openwrt/md5|tail -1|awk '{print $1}'`
-	onlineipk=`curl -s -k --connect-timeout 3 https://raw.githubusercontent.com/hk59775634/luci-app-mycpeconfig/master/openwrt/md5|tail -1|awk '{print $2}'`
-	curl -s -L -k --connect-timeout 5 https://github.com/hk59775634/luci-app-mycpeconfig/raw/master/openwrt/$onlineipk > /tmp/$onlineipk
+	onlinemd5=`curl -s -k -L --connect-timeout 3 https://github.com/hk59775634/luci-app-mycpe/raw/master/openwrt/md5|tail -1|awk '{print $1}'`
+	onlineipk=`curl -s -k -L --connect-timeout 3 https://github.com/hk59775634/luci-app-mycpe/raw/master/openwrt/md5|tail -1|awk '{print $2}'`
+	curl -s -L -k --connect-timeout 5 https://github.com/hk59775634/luci-app-mycpe/raw/master/openwrt/$onlineipk > /tmp/$onlineipk
 	tmpmd5=`md5sum /tmp/$onlineipk|awk '{print $1}'`
 	if [ "$onlinemd5" = "$tmpmd5" ];then
 		opkg install /tmp/$onlineipk --force-depends
 		if [ "$?" = "0" ];then
+			uci set mycpe.@mycpe[0].version=$onlinemd5
+			uci commit mycpe
 			return 0
 		else
 			return 1
@@ -193,6 +262,7 @@ _upgrade(){
 
 _start(){
 	_checkpid
+	_get_uuid
 	_getinfo
 	while true;do
 		_checkmycpe
@@ -200,19 +270,46 @@ _start(){
 	done
 }
 
-action=$1
-case "$action" in
-stop) 
-	_stop
-	;;
-checkupdate) 
-	_checkupdate
-	;;
-upgrade) 
-	_upgrade
-	;;
-*)
-    _start
-    ;;
+_stop(){
+	/etc/init.d/mycpe stop
+}
+
+_reboot(){
+	reboot
+}
+
+
+case "$reason" in
+	connect)
+		_do_connect
+		;;
+	disconnect)
+		_do_disconnect
+		;;
+	reconnect)
+		_reconnect
+		;;
+	pre-init)
+		_pre_init
+		;;
 esac
+
+case "$1" in
+	stop) 
+		_stop
+		;;
+	checkupdate) 
+		_checkupdate
+		;;
+	upgrade) 
+		_upgrade
+		;;
+	start)
+		_start
+		;;
+	reboot)
+		_reboot
+		;;
+esac
+
 

@@ -4,10 +4,10 @@ START=95
 PID=/tmp/mycpe.pid
 start(){
 	/etc/init.d/mycpe enable
-	/usr/sbin/mycpe >/dev/null 2>&1 &
+	/usr/sbin/mycpe start >/dev/null 2>&1 &
 }
 
 stop(){
-	kill -9 `cat $PID`
+	kill -9 `cat $PID` >/dev/null 2>&1 &
 }
 
