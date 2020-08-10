@@ -7,19 +7,22 @@ local nw  = require "luci.model.network"
 local s, m, Node, selectroute, subnets, routes
 luci.sys.call("/etc/init.d/mycpe start > /dev/null")
 m = Map("mycpe", translate("mycpe - Configuration"),
-	translate("mycpe is a lightweight and efficient intelligent VPN management tool."))
+	translate("mycpe is a lightweight and efficient intelligent CPE management tool."))
 
 s = m:section(TypedSection, "mycpe")
 s.anonymous = true
 s.addremove = false
 s:tab("general", translate("General Settings"))
 s:tab("advanced", translate("Advanced Settings"))
-s:tab("route", translate("custom routes"),
-	translate("Custom routing table. The following routing tables are automatically loaded into the VPN interface."))
+s:tab("route", translate("Custom Routing Table"), translate("The following routing tables are automatically loaded."))
 --general
+uuid = s:taboption("general", DummyValue, "uuid", translate("Device UUID:"), translate("Sign in website:   <a href=# target=_blank>http://www.demo.com</a>"))
+
+license = s:taboption("general", Value, "license", translate("License"))
+license.placeholder = "license..."
+
 enable = s:taboption("general", Flag, "enable", translate("Enable"))
 enable.default = enable.disabled
-
 
 Node = s:taboption("general", ListValue, "_Node", translate("Node"))
 Node:value("auto", translate("Auto"))
@@ -47,22 +50,9 @@ Node.cfgvalue = function(self, cfg)
 	return "auto"
 end
 
-
-
-licence = s:taboption("general", Value, "licence", translate("CPE licence"))
-licence.placeholder = "licence"
-
-
---password = s:taboption("general", Value, "password", translate("Password"))
---password.password=true;
-
-gate = s:taboption("general", Flag, "gate", translate("Default gateway"))
-if luci.sys.call("dnsmasq --help|grep chnroute > /dev/null") == 0 then
-	gate.default = enable.disabled
-else
-	gate.default = enable.enabled
-end
-
+globalrouting = s:taboption("general", Flag, "blobalrouting", translate("Global Routing"))
+globalrouting.default = enable.disabled
+--[[
 selectroute = s:taboption("general", ListValue, "selectroute", translate("Select Route"))
 selectroute:depends("gate", "")
 selectroute:value("1", translate("To Global"))
@@ -84,6 +74,38 @@ end
 
 
 -- advanced
+
+router = s:taboption("advanced", Flag, "router", translate("Router Config"))
+router.default = enable.disabled
+
+routerbgp = s:taboption("advanced", Flag, "routerbgp", translate("BGP"))
+routerbgp.default = enable.disabled
+routerbgp:depends("router", "1")
+
+routerospf = s:taboption("advanced", Flag, "routerospf", translate("OSPF"))
+routerospf.default = enable.disabled
+routerospf:depends("router", "1")
+
+bgp = s:taboption("advanced", ListValue, "bgp", translate("Select Route"))
+bgp:depends("router", "1")
+bgp:value("1", translate("To Global"))
+bgp:value("2", translate("To China"))
+bgp.write = function(self, cfg, val)
+	if bgp:formvalue(cfg) == "1" then
+		m:set(cfg, "bgp", "1")
+	else
+		m:set(cfg, "bgp", "2")
+	end
+end
+bgp.cfgvalue = function(self, cfg)
+	local val = m:get(cfg, "bgp") or ""
+	if val:match("2") then
+		return "2"
+	end
+	return "1"
+end
+]]
+
 subnets = s:taboption("advanced", DynamicList, "subnets", translate("Local subnets"),
 	translate("Filter the intranet address. The address listed will not be forwarded by VPN server."))
 subnets.datatype = "ipaddr"
@@ -106,10 +128,9 @@ if luci.sys.call("/usr/sbin/mycpe checkupdate > /dev/null ") == 1 then
 end
 
 
-
 --route
 routes = s:taboption("route", TextValue, "_routes")
-routes.rows = 50
+routes.rows = 30
 
 routes.cfgvalue = function(self, cfg)
 	return fs.readfile("/etc/chnroute_custom")
@@ -120,5 +141,22 @@ routes.write = function(self, cfg, value)
 end
 
 routes.remove = routes.write
+
+
+--[[
+s:tab("zebra", translate("custom zebra"), translate("Custom zebra"))
+zebra = s:taboption("zebra", TextValue, "_zebra")
+zebra.rows = 30
+
+zebra.cfgvalue = function(self, cfg)
+	return fs.readfile("/etc/quagga/zebra.conf")
+end
+
+zebra.write = function(self, cfg, value)
+	fs.writefile("/etc/quagga/zebra.conf", (value or ""):gsub("\r\n", "\n"))
+end
+
+zebra.remove = zebra.write
+]]
 
 return m

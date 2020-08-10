@@ -30,6 +30,7 @@ _get_uuid(){
 		uci commit mycpe       
 	else
 		uuid=`uci get mycpe.@mycpe[0].uuid`
+		uci commit mycpe
 	fi
 	echo uuid is $uuid
 }
